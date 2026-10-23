@@ -49,24 +49,34 @@ jobs:
           from urllib.request import Request, build_opener, HTTPRedirectHandler, urlopen
           import xml.etree.ElementTree as ET
 
-          FEEDS = ['https://www.dealabs.com/rss/hot.xml']
+          FEEDS = ['https://www.dealabs.com/rss/hot.xml', 'https://www.mydealz.de/rss/hot']
+          SITES = {'dealabs.com': ('Dealabs · France', '/bons-plans/'),
+                   'mydealz.de': ('Mydealz · Allemagne', '/deals/')}
+          DETAIL_LIMIT_PER_SOURCE = 8
           MIN_DISCOUNT = Decimal('60')
           MIN_PRICE = Decimal('20')
           MAX_AGE_HOURS = 6
           MAX_ALERTS = 5
-          INCLUDE = ['smartphone', 'iphone', 'galaxy', 'pixel', 'xiaomi', 'oneplus',
-                     'carte graphique', 'geforce', 'radeon', 'rtx', 'processeur', 'ryzen',
-                     'intel core', 'ssd', 'ram', 'ddr4', 'ddr5', 'pc portable', 'ordinateur',
-                     'macbook', 'ipad', 'tablette', 'playstation', 'ps5', 'xbox',
-                     'nintendo switch', 'steam deck', 'rog ally', 'ecran', 'moniteur',
-                     'casque', 'ecouteurs', 'airpods', 'montre connectee', 'apple watch',
-                     'galaxy watch', 'dyson', 'lego']
+          INCLUDE = ['smartphone', 'iphone', 'google pixel', 'samsung galaxy', 'oneplus',
+                     'redmi', 'poco', 'carte graphique', 'geforce', 'radeon', 'rtx',
+                     'processeur', 'ryzen', 'intel core', 'ssd', 'ram', 'ddr4', 'ddr5',
+                     'pc portable', 'pc gamer', 'pc gaming', 'mini pc', 'ordinateur',
+                     'macbook', 'ipad', 'tablette', 'ecran pc', 'moniteur', 'monitor',
+                     'clavier', 'souris', 'carte mere', 'boitier pc', 'alimentation pc',
+                     'laptop', 'notebook', 'grafikkarte', 'prozessor', 'arbeitsspeicher',
+                     'mainboard', 'tastatur', 'gaming maus', 'tablet', 'chromebook']
           EXCLUDE = ['reconditionne', 'occasion', 'abonnement', 'forfait', 'reprise',
                      'odr', 'remboursement', "bon d'achat", "bons d'achat", 'fidelite',
                      'sur la carte', 'nouveaux clients', 'nouveau client', "jusqu'a",
                      'a partir de', 'expire', 'epuise', 'coque', 'verre trempe',
-                     'housse', 'compatible avec', 'support pour', 'coupon', 'dematerialise']
-          NUMBER = r'\d+(?:[\s\u00a0\u202f]\d{3})*(?:[.,]\d{1,2})?'
+                     'housse', 'compatible avec', 'support pour', 'coupon', 'dematerialise',
+                     'lego', 'dyson', 'jouet', 'rangement', 'figurine', 'star wars',
+                     'watch', 'montre', 'airpods', 'buds', 'casque', 'ecouteurs',
+                     'televiseur', 'tv', 'aspirateur', 'robot', 'gebraucht', 'refurbished',
+                     'b-ware', 'vertrag', 'abo', 'trade-in', 'cashback', 'neukunden',
+                     'lokal', 'abgelaufen', 'handyhulle', 'schutzfolie', 'ersatzdisplay',
+                     'chocolat', 'schokolade']
+          NUMBER = r'\d+(?:[.\s\u00a0\u202f]\d{3})*(?:[.,]\d{1,2})?'
           EURO = r'\s*(?:€|eur\b|euros?\b)'
 
 
@@ -92,7 +102,10 @@ jobs:
 
           def money(value):
               try:
-                  n = Decimal(re.sub(r'\s', '', value).replace(',', '.'))
+                  value = re.sub(r'\s', '', value)
+                  if ',' in value:
+                      value = value.replace('.', '').replace(',', '.')
+                  n = Decimal(value)
                   return n if n.is_finite() and n > 0 else None
               except (InvalidOperation, TypeError):
                   return None
@@ -244,8 +257,8 @@ jobs:
                       if len(list(folder.glob('*.html'))) < 2:
                           deal_id = re.search(r'-(\d+)/?$', urlsplit(item['link']).path)
                           if deal_id:
-                              (folder / (deal_id[1] + '.html')).write_bytes(page)
-                              (folder / (deal_id[1] + '.json')).write_text(json.dumps(item, ensure_ascii=False, indent=2))
+                              (folder / ((urlsplit(item['link']).hostname or '') + '-' + deal_id[1] + '.html')).write_bytes(page)
+                              (folder / ((urlsplit(item['link']).hostname or '') + '-' + deal_id[1] + '.json')).write_text(json.dumps(item, ensure_ascii=False, indent=2))
                   return result
               except (HTTPError, URLError, TimeoutError, OSError, ValueError, RecursionError) as exc:
                   reason = f'HTTP {exc.code}' if isinstance(exc, HTTPError) else type(exc).__name__
@@ -274,7 +287,8 @@ jobs:
               if keyword(text, EXCLUDE):
                   return None, 'exclusion'
               u = urlsplit(item['link'])
-              if u.scheme != 'https' or u.hostname not in ('www.dealabs.com', 'dealabs.com') or not u.path.startswith('/bons-plans/'):
+              host = (u.hostname or '').removeprefix('www.')
+              if u.scheme != 'https' or host not in SITES or not u.path.startswith(SITES[host][1]):
                   return None, 'lien_non_reconnu'
               try:
                   date = parsedate_to_datetime(item['pubDate'])
@@ -291,7 +305,7 @@ jobs:
               price, reference, discount = prices
               if price < MIN_PRICE or discount < MIN_DISCOUNT:
                   return None, 'sous_le_seuil'
-              return {'title': title, 'url': 'https://www.dealabs.com' + u.path,
+              return {'title': title, 'url': 'https://www.' + host + u.path,
                       'price': price, 'reference': reference, 'discount': discount}, 'retenu'
 
 
@@ -333,8 +347,11 @@ jobs:
               ref = (f"{deal['reference']:.2f} € (annoncé par la source)"
                      if deal['reference'] else 'non fourni ; pourcentage annoncé uniquement')
               title = deal['title'].replace('@', '＠')[:220]
+              host = (urlsplit(deal['url']).hostname or '').removeprefix('www.')
+              origin = SITES[host][0]
+              foreign = '\nOffre étrangère : livraison en France, frais et clavier AZERTY/QWERTZ à vérifier.' if host != 'dealabs.com' else ''
               return (f"🔎 **Réduction annoncée : −{deal['discount']:.1f} % — à vérifier**\n"
-                      f"{title}\n**Prix annoncé : {deal['price']:.2f} €**\n"
+                      f"{title}\nSource : {origin}{foreign}\n**Prix annoncé : {deal['price']:.2f} €**\n"
                       f"Référence : {ref}\n{deal['url']}\n"
                       'Livraison, stock, état et vendeur à confirmer sur la fiche. '
                       'Prix habituel non vérifié ; marge de revente non évaluée. '
@@ -366,6 +383,8 @@ jobs:
               detail_count = 0
               inspected_links = set()
               for source in FEEDS:
+                  source_details = 0
+                  source_stats = Counter()
                   try:
                       req = Request(source, headers={'User-Agent': 'RadarPrix/1.0 (personal RSS reader)'})
                       with urlopen(req, timeout=20) as r:
@@ -376,12 +395,13 @@ jobs:
                               continue
                           inspected_links.add(item['link'])
                           deal, reason = candidate(item, now)
-                          if reason == 'prix_ou_reference_absent' and detail_count < 8:
+                          if reason == 'prix_ou_reference_absent' and source_details < DETAIL_LIMIT_PER_SOURCE:
                               current = feed_price(item['description'])
                               if current is not None and current < MIN_PRICE:
                                   reason = 'prix_trop_faible'
                               elif current is not None:
                                   detail_count += 1
+                                  source_details += 1
                                   prices, detail_reason = enrich_item(item, capture=status)
                                   print('FICHE ' + json.dumps({'url': item['link'], 'resultat': detail_reason}, ensure_ascii=False))
                                   if prices is not None:
@@ -393,6 +413,7 @@ jobs:
                                       stats['fiches_sans_reference'] += 1
                                   time.sleep(0.5)
                           stats[reason] += 1
+                          source_stats[reason] += 1
                           if status and reason == 'prix_ou_reference_absent' and diagnostic_count < 3:
                               # Public feed fields only; never include environment or webhook.
                               sample = {k: v[:4000] for k, v in item.items()}
@@ -400,6 +421,7 @@ jobs:
                               diagnostic_count += 1
                           if deal:
                               deals[deal['url']] = deal
+                      print('SOURCE ' + json.dumps({'source': source, 'offres': len(items), 'compteurs': dict(source_stats), 'fiches': source_details}, ensure_ascii=False))
                   except (HTTPError, URLError, TimeoutError, OSError, ValueError, ET.ParseError) as e:
                       label = f'HTTP {e.code}' if isinstance(e, HTTPError) else type(e).__name__
                       errors.append(f'{source} : {label}')
@@ -412,8 +434,8 @@ jobs:
               summary += (f"\nFlux lus : {stats['flux_lus']}/{len(FEEDS)}. "
                           f"Offres avec prix et réduction interprétables : {analyzable}. "
                           f"Offres au seuil : {len(deals)}.\n"
-                          f"Fiches consultées : {detail_count}/8 maximum ; références trouvées : {stats['references_fiches']}.\n"
-                          'Sources : offres communautaires Dealabs ; pas de scan direct des boutiques.\n')
+                          f"Fiches consultées : {detail_count}/{DETAIL_LIMIT_PER_SOURCE * len(FEEDS)} maximum ; références trouvées : {stats['references_fiches']}.\n"
+                          'Sources : Dealabs (France), Mydealz (Allemagne) ; informatique et smartphones.\n')
               if no_prices:
                   summary += 'Le lecteur ne trouve pas les données nécessaires au filtre −60 % dans les offres ciblées.\n'
               if errors:
@@ -597,7 +619,7 @@ jobs:
                   self.assertIsNone(radar.extract_reference(html, item()['link'], Decimal('100'))[0])
 
               def test_digital_games_excluded(self):
-                  self.assertEqual(radar.candidate(item('Xbox jeu à 20€ au lieu de 100€ (Dématérialisé)'), NOW)[1], 'exclusion')
+                  self.assertIsNone(radar.candidate(item('Xbox jeu à 20€ au lieu de 100€ (Dématérialisé)'), NOW)[0])
 
           class QuietScheduleTests(unittest.TestCase):
               def test_scheduled_failure_sends_no_discord_report(self):
@@ -628,6 +650,30 @@ jobs:
               def test_missing_reference_in_real_structure_is_not_invented(self):
                   page = '<script>window.__INITIAL_STATE__ = {"threadDetail":{"threadId":"123","price":100,"nextBestPrice":null},"other":{"threadId":"456","price":100,"nextBestPrice":250}};</script>'
                   self.assertIsNone(radar.extract_reference(page, item()['link'], Decimal('100'))[0])
+
+          class ScopeAndSourceTests(unittest.TestCase):
+              def test_lego_alert_is_now_rejected(self):
+                  offer = item('Lot de 2 briques de rangement empilables Lego', '<strong>21,99€ - Marchand</strong>')
+                  self.assertIsNone(radar.candidate(offer, NOW, (Decimal('21.99'), Decimal('59.99'), Decimal('63.3')))[0])
+
+              def test_it_and_smartphone_only(self):
+                  for title in ['Smartphone Samsung Galaxy S25', 'SSD Samsung', 'PC portable Lenovo', 'Grafikkarte GeForce RTX', 'Clavier Logitech']:
+                      self.assertIsNotNone(radar.candidate(item(title), NOW, (Decimal('100'), Decimal('250'), Decimal('60')))[0])
+                  for title in ['Casque Star Wars', 'Dyson aspirateur', 'Galaxy Watch', 'Tablette de chocolat', 'Coque pour iPhone']:
+                      offer = item(title)
+                      self.assertIsNone(radar.candidate(offer, NOW, (Decimal('100'), Decimal('250'), Decimal('60')))[0])
+
+              def test_german_link_keeps_its_domain_and_country(self):
+                  offer = item('Grafikkarte RTX à 100€ au lieu de 250€')
+                  offer['link'] = 'https://www.mydealz.de/deals/rtx-123'
+                  result, reason = radar.candidate(offer, NOW)
+                  self.assertEqual(reason, 'retenu')
+                  self.assertEqual(result['url'], offer['link'])
+                  self.assertIn('Allemagne', radar.alert_text(result))
+                  self.assertIn('livraison en France', radar.alert_text(result))
+
+              def test_german_thousands_format(self):
+                  self.assertEqual(radar.feed_price('<strong>1.299,99€ - Amazon</strong>'), Decimal('1299.99'))
           TESTS_PY
           python3 -m unittest discover -s /tmp/radar-code/tests -v
       - name: Contrôler les sources et envoyer les alertes
