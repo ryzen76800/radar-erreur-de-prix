@@ -3,7 +3,7 @@
 name: Radar prix
 on:
   schedule:
-    - cron: '7,22,37,52 * * * *'
+    - cron: '2-59/5 * * * *'
   workflow_dispatch:
   push:
     branches: [main]
@@ -215,7 +215,7 @@ jobs:
               return (price, reference, (1 - price / reference) * 100), 'reference_fiche'
 
 
-          def enrich_item(item):
+          def enrich_item(item, capture=False):
               expected = feed_price(item['description'])
               if expected is None:
                   return None, 'prix_flux_absent'
@@ -227,7 +227,16 @@ jobs:
                       page = response.read(4_000_001)
                   if len(page) > 4_000_000:
                       return None, 'fiche_trop_volumineuse'
-                  return extract_reference(page.decode('utf-8', errors='replace'), item['link'], expected)
+                  result = extract_reference(page.decode('utf-8', errors='replace'), item['link'], expected)
+                  if capture and result[0] is None:
+                      folder = Path('/tmp/radar-diagnostic')
+                      folder.mkdir(parents=True, exist_ok=True)
+                      if len(list(folder.glob('*.html'))) < 2:
+                          deal_id = re.search(r'-(\d+)/?$', urlsplit(item['link']).path)
+                          if deal_id:
+                              (folder / (deal_id[1] + '.html')).write_bytes(page)
+                              (folder / (deal_id[1] + '.json')).write_text(json.dumps(item, ensure_ascii=False, indent=2))
+                  return result
               except (HTTPError, URLError, TimeoutError, OSError, ValueError, RecursionError) as exc:
                   reason = f'HTTP {exc.code}' if isinstance(exc, HTTPError) else type(exc).__name__
                   return None, reason
@@ -363,7 +372,7 @@ jobs:
                                   reason = 'prix_trop_faible'
                               elif current is not None:
                                   detail_count += 1
-                                  prices, detail_reason = enrich_item(item)
+                                  prices, detail_reason = enrich_item(item, capture=status)
                                   print('FICHE ' + json.dumps({'url': item['link'], 'resultat': detail_reason}, ensure_ascii=False))
                                   if prices is not None:
                                       stats['references_fiches'] += 1
@@ -401,10 +410,8 @@ jobs:
                   summary += 'Sources en erreur :\n' + '\n'.join(errors) + '\n'
               summary += 'Consulte Actions sur GitHub si le contrôle échoue. Aucun bénéfice garanti.'
               health = hashlib.sha256((str(unhealthy) + str(bool(errors))).encode()).hexdigest()
-              due = (status or not state.get('last_report') or
-                     (health != state.get('health')) or
-                     (unhealthy and now - state['last_report'] >= 86400) or
-                     now - state['last_report'] >= 7 * 86400)
+              # Scheduled runs only send offer alerts; manual runs include diagnostics.
+              due = status
               if dry_run:
                   print(summary)
                   for deal in deals.values():
@@ -536,7 +543,7 @@ jobs:
                       response.__enter__.return_value.read.return_value = xml
                       with patch.object(radar, 'urlopen', return_value=response), patch.object(radar.time, 'time', return_value=NOW), patch.dict(radar.os.environ, {'DISCORD_WEBHOOK_URL': 'dummy'}), patch.object(radar, 'send_discord', side_effect=[None, RuntimeError('failed')]):
                           with self.assertRaises(RuntimeError):
-                              radar.run(state_path=target)
+                              radar.run(status=True, state_path=target)
                       self.assertEqual(radar.json.loads(target.read_text())['seen'], {})
 
 
@@ -581,6 +588,15 @@ jobs:
 
               def test_digital_games_excluded(self):
                   self.assertEqual(radar.candidate(item('Xbox jeu à 20€ au lieu de 100€ (Dématérialisé)'), NOW)[1], 'exclusion')
+
+          class QuietScheduleTests(unittest.TestCase):
+              def test_scheduled_failure_sends_no_discord_report(self):
+                  from urllib.error import URLError
+                  with TemporaryDirectory() as directory:
+                      with patch.object(radar, 'urlopen', side_effect=URLError('offline')), patch.dict(radar.os.environ, {'DISCORD_WEBHOOK_URL': 'dummy'}), patch.object(radar, 'send_discord') as send:
+                          code = radar.run(state_path=Path(directory) / 'state.json')
+                      self.assertEqual(code, 2)
+                      send.assert_not_called()
           TESTS_PY
           python3 -m unittest discover -s /tmp/radar-code/tests -v
       - name: Contrôler les sources et envoyer les alertes
@@ -594,6 +610,14 @@ jobs:
           else
             python3 /tmp/radar-code/radar.py
           fi
+      - name: Enregistrer les fiches pour réparer le lecteur
+        if: always() && github.event_name != 'schedule'
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostic-fiches
+          path: /tmp/radar-diagnostic/
+          retention-days: 3
+          if-no-files-found: ignore
       - name: Conserver les alertes déjà envoyées
         if: always()
         shell: bash
