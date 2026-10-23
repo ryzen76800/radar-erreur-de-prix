@@ -1,0 +1,444 @@
+# Installation : coller ce fichier dans .github/workflows/radar.yml sur GitHub.
+# Source : flux communautaires Dealabs, pas de scan direct des boutiques.
+name: Radar prix
+on:
+  schedule:
+    - cron: '7,22,37,52 * * * *'
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/radar.yml']
+permissions:
+  contents: write
+concurrency:
+  group: radar-prix
+  cancel-in-progress: false
+jobs:
+  surveiller:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Lire le dépôt et les alertes précédentes
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Préparer le radar et vérifier les filtres
+        shell: bash
+        run: |
+          mkdir -p /tmp/radar-code/tests
+          cat > /tmp/radar-code/radar.py <<'RADAR_PY'
+          """Radar de réductions annoncées dans les flux RSS publics, Python 3.11+."""
+          import argparse
+          from collections import Counter
+          from datetime import datetime, timezone
+          from decimal import Decimal, InvalidOperation
+          from email.utils import parsedate_to_datetime
+          import hashlib
+          from html import unescape
+          from html.parser import HTMLParser
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import time
+          import unicodedata
+          from urllib.error import HTTPError, URLError
+          from urllib.parse import urlsplit
+          from urllib.request import Request, build_opener, HTTPRedirectHandler, urlopen
+          import xml.etree.ElementTree as ET
+
+          FEEDS = ['https://www.dealabs.com/rss/tout', 'https://www.dealabs.com/rss/hot.xml']
+          MIN_DISCOUNT = Decimal('60')
+          MIN_PRICE = Decimal('20')
+          MAX_AGE_HOURS = 6
+          MAX_ALERTS = 5
+          INCLUDE = ['smartphone', 'iphone', 'galaxy', 'pixel', 'xiaomi', 'oneplus',
+                     'carte graphique', 'geforce', 'radeon', 'rtx', 'processeur', 'ryzen',
+                     'intel core', 'ssd', 'ram', 'ddr4', 'ddr5', 'pc portable', 'ordinateur',
+                     'macbook', 'ipad', 'tablette', 'playstation', 'ps5', 'xbox',
+                     'nintendo switch', 'steam deck', 'rog ally', 'ecran', 'moniteur',
+                     'casque', 'ecouteurs', 'airpods', 'montre connectee', 'apple watch',
+                     'galaxy watch', 'dyson', 'lego']
+          EXCLUDE = ['reconditionne', 'occasion', 'abonnement', 'forfait', 'reprise',
+                     'odr', 'remboursement', "bon d'achat", "bons d'achat", 'fidelite',
+                     'sur la carte', 'nouveaux clients', 'nouveau client', "jusqu'a",
+                     'a partir de', 'expire', 'epuise', 'coque', 'verre trempe',
+                     'housse', 'compatible avec', 'support pour', 'coupon']
+          NUMBER = r'\d+(?:[\s\u00a0\u202f]\d{3})*(?:[.,]\d{1,2})?'
+          EURO = r'\s*(?:€|eur\b|euros?\b)'
+
+
+          def normalized(value):
+              value = value.lower().replace('’', "'").replace('−', '-').replace('–', '-')
+              return ''.join(c for c in unicodedata.normalize('NFKD', value)
+                             if not unicodedata.combining(c))
+
+
+          class PlainText(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.parts = []
+              def handle_data(self, data):
+                  self.parts.append(data)
+
+
+          def plain(value):
+              p = PlainText()
+              p.feed(value)
+              return re.sub(r'\s+', ' ', unescape(' '.join(p.parts))).strip()
+
+
+          def money(value):
+              try:
+                  n = Decimal(re.sub(r'\s', '', value).replace(',', '.'))
+                  return n if n.is_finite() and n > 0 else None
+              except (InvalidOperation, TypeError):
+                  return None
+
+
+          def keyword(text, words):
+              return any(re.search(r'(?<!\w)' + re.escape(w) + r'(?!\w)', text)
+                         for w in words)
+
+
+          def parse_prices(title, description):
+              # Only the title and opening price block, never arbitrary prices deep in a review.
+              text = normalized(title + ' ' + description[:500])
+              pair = re.search('(' + NUMBER + ')' + EURO +
+                               r'\s*(?:au lieu de|contre)\s*(' + NUMBER + ')' + EURO, text)
+              if pair:
+                  price, reference = money(pair[1]), money(pair[2])
+              else:
+                  current = re.search(r'\bprix\s*:\s*(' + NUMBER + ')' + EURO, text)
+                  if not current:
+                      current = re.search('(' + NUMBER + ')' + EURO, normalized(title))
+                  reference_match = re.search(
+                      r'\b(?:prix habituel|prix de reference|ancien prix)\s*:\s*(' +
+                      NUMBER + ')' + EURO, text)
+                  price = money(current[1]) if current else None
+                  reference = money(reference_match[1]) if reference_match else None
+              if price is None:
+                  return None
+              if reference is not None:
+                  if reference <= price:
+                      return None
+                  return price, reference, (1 - price / reference) * 100
+              # No numeric price reference is invented from an advertised percentage.
+              discount = re.search(r'(?:-\s*(\d{1,2}(?:[.,]\d+)?)\s*%|'
+                                   r'(\d{1,2}(?:[.,]\d+)?)\s*%\s*de\s*(?:reduction|remise)|'
+                                   r'(?:reduction|remise)\s*de\s*(\d{1,2}(?:[.,]\d+)?)\s*%)', text)
+              if discount:
+                  amount = money(next(g for g in discount.groups() if g is not None))
+                  if amount and amount < 100:
+                      return price, None, amount
+              return None
+
+
+          def parse_feed(data):
+              if len(data) > 2_000_000 or b'<!DOCTYPE' in data.upper() or b'<!ENTITY' in data.upper():
+                  raise ValueError('XML trop volumineux ou non autorisé')
+              root = ET.fromstring(data)
+              if root.tag != 'rss':
+                  raise ValueError('La source ne renvoie pas un flux RSS')
+              items = root.findall('./channel/item')
+              if not items:
+                  raise ValueError('Flux vide : surveillance non vérifiée')
+              return [{key: item.findtext(key, '') for key in
+                       ['title', 'description', 'link', 'pubDate']} for item in items]
+
+
+          def candidate(item, now):
+              title = plain(item['title'])
+              description = plain(item['description'])
+              text = normalized(title + ' ' + description)
+              if not keyword(normalized(title), INCLUDE):
+                  return None, 'hors_cible'
+              if keyword(text, EXCLUDE):
+                  return None, 'exclusion'
+              u = urlsplit(item['link'])
+              if u.scheme != 'https' or u.hostname not in ('www.dealabs.com', 'dealabs.com') or not u.path.startswith('/bons-plans/'):
+                  return None, 'lien_non_reconnu'
+              try:
+                  date = parsedate_to_datetime(item['pubDate'])
+                  if date.tzinfo is None:
+                      return None, 'date_absente'
+                  age = now - date.timestamp()
+              except (ValueError, TypeError, OverflowError):
+                  return None, 'date_absente'
+              if age < -300 or age > MAX_AGE_HOURS * 3600:
+                  return None, 'trop_ancien'
+              prices = parse_prices(title, description)
+              if prices is None:
+                  return None, 'prix_ou_reference_absent'
+              price, reference, discount = prices
+              if price < MIN_PRICE or discount < MIN_DISCOUNT:
+                  return None, 'sous_le_seuil'
+              return {'title': title, 'url': 'https://www.dealabs.com' + u.path,
+                      'price': price, 'reference': reference, 'discount': discount}, 'retenu'
+
+
+          class NoRedirect(HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  return None
+
+
+          def send_discord(message, webhook):
+              if not re.fullmatch(r'https://discord\.com/api(?:/v\d+)?/webhooks/\d+/[A-Za-z0-9_-]+', webhook):
+                  raise ValueError('Secret DISCORD_WEBHOOK_URL absent ou invalide')
+              body = json.dumps({'content': message[:1950], 'allowed_mentions': {'parse': []}},
+                                ensure_ascii=False).encode()
+              request = Request(webhook + '?wait=true', data=body,
+                                headers={'Content-Type': 'application/json', 'User-Agent': 'RadarPrix/1.0'})
+              for attempt in range(3):
+                  try:
+                      with build_opener(NoRedirect()).open(request, timeout=20) as r:
+                          if r.status != 200:
+                              raise RuntimeError('Discord ne confirme pas le message')
+                          response = json.load(r)
+                          if not response.get('id'):
+                              raise RuntimeError('Discord ne confirme pas le message')
+                          return
+                  except HTTPError as e:
+                      if e.code == 429 and attempt < 2:
+                          try:
+                              delay = float(json.loads(e.read()).get('retry_after', 1))
+                          except (ValueError, TypeError):
+                              delay = 1
+                          time.sleep(max(1, min(delay, 30)))
+                          continue
+                      raise RuntimeError(f'Envoi Discord refusé (HTTP {e.code})') from None
+                  except (URLError, TimeoutError, OSError):
+                      raise RuntimeError('Envoi Discord non confirmé ; réseau indisponible') from None
+
+
+          def alert_text(deal):
+              ref = (f"{deal['reference']:.2f} € (annoncé par la source)"
+                     if deal['reference'] else 'non fourni ; pourcentage annoncé uniquement')
+              title = deal['title'].replace('@', '＠')[:220]
+              return (f"🔎 **Réduction annoncée : −{deal['discount']:.1f} % — à vérifier**\n"
+                      f"{title}\n**Prix annoncé : {deal['price']:.2f} €**\n"
+                      f"Référence : {ref}\n{deal['url']}\n"
+                      'Livraison, stock, état et vendeur à confirmer sur la fiche. '
+                      'Prix habituel non vérifié ; marge de revente non évaluée. '
+                      'Une erreur de prix n’est pas confirmée.')
+
+
+          def already_sent(deal, seen):
+              previous = seen.get(deal['url'])
+              return previous is not None and deal['price'] >= Decimal(previous['price'])
+
+
+          def save_state(path, state):
+              path.parent.mkdir(parents=True, exist_ok=True)
+              tmp = path.with_suffix('.tmp')
+              tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2) + '\n')
+              tmp.replace(path)
+
+
+          def run(dry_run=False, status=False, state_path=Path('data/state.json')):
+              now = time.time()
+              state = json.loads(state_path.read_text()) if state_path.exists() else {}
+              seen = state.setdefault('seen', {})
+              webhook = os.environ.get('DISCORD_WEBHOOK_URL', '').strip()
+              if not dry_run and not webhook:
+                  raise ValueError('Le secret DISCORD_WEBHOOK_URL est absent')
+              stats = Counter()
+              errors, deals = [], {}
+              for source in FEEDS:
+                  try:
+                      req = Request(source, headers={'User-Agent': 'RadarPrix/1.0 (personal RSS reader)'})
+                      with urlopen(req, timeout=20) as r:
+                          items = parse_feed(r.read(2_000_001))
+                      stats['flux_lus'] += 1
+                      for item in items:
+                          deal, reason = candidate(item, now)
+                          stats[reason] += 1
+                          if deal:
+                              deals[deal['url']] = deal
+                  except (HTTPError, URLError, TimeoutError, OSError, ValueError, ET.ParseError) as e:
+                      label = f'HTTP {e.code}' if isinstance(e, HTTPError) else type(e).__name__
+                      errors.append(f'{source} : {label}')
+              print(json.dumps({'compteurs': dict(stats), 'erreurs': errors}, ensure_ascii=False))
+              # Refuse a green success when no usable price data can be interpreted.
+              analyzable = stats['retenu'] + stats['sous_le_seuil']
+              no_prices = stats['prix_ou_reference_absent'] > 0 and analyzable == 0
+              unhealthy = not stats['flux_lus'] or no_prices
+              summary = ('⚠️ Surveillance non validée' if unhealthy else '📡 Contrôle du radar terminé')
+              summary += (f"\nFlux lus : {stats['flux_lus']}/{len(FEEDS)}. "
+                          f"Offres avec prix et réduction interprétables : {analyzable}. "
+                          f"Offres au seuil : {len(deals)}.\n"
+                          'Sources : offres communautaires Dealabs ; pas de scan direct des boutiques.\n')
+              if no_prices:
+                  summary += 'Les offres ciblées ne fournissent pas les données nécessaires au filtre −60 %.\n'
+              if errors:
+                  summary += 'Sources en erreur :\n' + '\n'.join(errors) + '\n'
+              summary += 'Consulte Actions sur GitHub si le contrôle échoue. Aucun bénéfice garanti.'
+              health = hashlib.sha256((str(unhealthy) + str(bool(errors))).encode()).hexdigest()
+              due = (status or not state.get('last_report') or
+                     (health != state.get('health')) or
+                     (unhealthy and now - state['last_report'] >= 86400) or
+                     now - state['last_report'] >= 7 * 86400)
+              if dry_run:
+                  print(summary)
+                  for deal in deals.values():
+                      print(alert_text(deal))
+                  return 2 if unhealthy else 0
+              if due:
+                  send_discord(summary, webhook)
+                  state.update(last_report=now, health=health)
+                  save_state(state_path, state)
+              sent = 0
+              for deal in sorted(deals.values(), key=lambda x: x['discount'], reverse=True):
+                  if already_sent(deal, seen) or sent >= MAX_ALERTS:
+                      continue
+                  send_discord(alert_text(deal), webhook)
+                  seen[deal['url']] = {'price': str(deal['price']), 'sent_at': now}
+                  save_state(state_path, state)
+                  sent += 1
+                  time.sleep(1)
+              print(f'Alertes confirmées par Discord : {sent}')
+              # Bound retained public state to 30 days.
+              state['seen'] = {k: v for k, v in seen.items() if now - v['sent_at'] < 30 * 86400}
+              save_state(state_path, state)
+              return 2 if unhealthy else 0
+
+
+          if __name__ == '__main__':
+              parser = argparse.ArgumentParser()
+              parser.add_argument('--dry-run', action='store_true')
+              parser.add_argument('--status', action='store_true')
+              args = parser.parse_args()
+              try:
+                  raise SystemExit(run(args.dry_run, args.status))
+              except (ValueError, RuntimeError, OSError, KeyError, InvalidOperation) as error:
+                  # Do not print raw network exceptions, which may contain the webhook token.
+                  print('Échec du radar :', type(error).__name__,
+                        str(error) if isinstance(error, (ValueError, RuntimeError)) else 'état local invalide')
+                  raise SystemExit(1)
+          RADAR_PY
+          cat > /tmp/radar-code/tests/test_radar.py <<'TESTS_PY'
+          import sys
+          from pathlib import Path
+          sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+          from datetime import datetime, timezone
+          from decimal import Decimal
+          from email.utils import format_datetime
+          from tempfile import TemporaryDirectory
+          import unittest
+          from unittest.mock import patch
+          import radar
+
+          NOW = 1800000000
+
+
+          def item(title='SSD Samsung à 100€ au lieu de 250€', description='Produit neuf'):
+              return dict(title=title, description=description,
+                          link='https://www.dealabs.com/bons-plans/ssd-test-123',
+                          pubDate=format_datetime(datetime.fromtimestamp(NOW, timezone.utc)))
+
+
+          class RadarTests(unittest.TestCase):
+              def test_exact_threshold(self):
+                  deal, reason = radar.candidate(item(), NOW)
+                  self.assertEqual(reason, 'retenu')
+                  self.assertEqual(deal['discount'], Decimal('60'))
+                  self.assertEqual(radar.candidate(item('SSD à 100,01€ au lieu de 250€'), NOW)[1], 'sous_le_seuil')
+
+              def test_unknown_reference_is_not_invented(self):
+                  self.assertIsNone(radar.parse_prices('SSD 100€', 'Super promotion'))
+                  price, ref, discount = radar.parse_prices('SSD 100€ (-60%)', '')
+                  self.assertIsNone(ref)
+                  self.assertEqual(discount, Decimal('60'))
+
+              def test_unrelated_percentage(self):
+                  self.assertIsNone(radar.parse_prices('SSD 100€', '100% satisfait et 60% recyclé'))
+
+              def test_french_price(self):
+                  self.assertEqual(radar.parse_prices('PC portable 399,99€ au lieu de 1\u202f200€', '')[1], Decimal('1200'))
+
+              def test_exclusions(self):
+                  for note in ['Avec reprise', 'Reconditionné', 'via ODR', "bon d’achat", 'Expiré', 'abonnement']:
+                      self.assertIsNone(radar.candidate(item(description=note), NOW)[0])
+
+              def test_accessory_and_wrong_category(self):
+                  for title in ['Coque iPhone à 20€ au lieu de 100€', 'Livre à 20€ au lieu de 100€']:
+                      self.assertIsNone(radar.candidate(item(title), NOW)[0])
+
+              def test_stale_or_unknown_date(self):
+                  self.assertEqual(radar.candidate(item(), NOW + 7 * 3600)[1], 'trop_ancien')
+                  example = item()
+                  example['pubDate'] = ''
+                  self.assertEqual(radar.candidate(example, NOW)[1], 'date_absente')
+
+              def test_bad_link(self):
+                  example = item()
+                  example['link'] = 'https://www.dealabs.com.evil.test/bons-plans/123'
+                  self.assertIsNone(radar.candidate(example, NOW)[0])
+
+              def test_no_discount_or_negative_reference(self):
+                  self.assertIsNone(radar.parse_prices('SSD 100€ au lieu de 50€', ''))
+
+              def test_dedup_and_lower_price(self):
+                  deal, _ = radar.candidate(item(), NOW)
+                  seen = {deal['url']: {'price': '100', 'sent_at': NOW}}
+                  self.assertTrue(radar.already_sent(deal, seen))
+                  deal['price'] = Decimal('90')
+                  self.assertFalse(radar.already_sent(deal, seen))
+
+              def test_feed_format_changes_fail_loudly(self):
+                  for data in [b'<html>blocked</html>', b'<rss><channel/></rss>', b'<!DOCTYPE rss><rss/>']:
+                      with self.assertRaises(ValueError):
+                          radar.parse_feed(data)
+
+              def test_xml_and_html(self):
+                  data = b'<rss><channel><item><title>SSD</title><description><![CDATA[<b>Prix :</b> 100 EUR]]></description></item></channel></rss>'
+                  self.assertEqual(radar.plain(radar.parse_feed(data)[0]['description']), 'Prix : 100 EUR')
+
+              def test_secret_rejected_without_network(self):
+                  with self.assertRaises(ValueError):
+                      radar.send_discord('test', 'https://example.com/secret')
+
+              def test_failed_send_does_not_mark_sent(self):
+                  with TemporaryDirectory() as directory:
+                      target = Path(directory) / 'state.json'
+                      xml = ('<rss><channel><item><title>SSD 100€ au lieu de 250€</title>'
+                             '<description>Neuf</description><link>https://www.dealabs.com/bons-plans/ssd-test-123</link>'
+                             '<pubDate>' + item()['pubDate'] + '</pubDate></item></channel></rss>').encode()
+                      from unittest.mock import MagicMock
+                      response = MagicMock()
+                      response.__enter__.return_value.read.return_value = xml
+                      with patch.object(radar, 'urlopen', return_value=response), patch.object(radar.time, 'time', return_value=NOW), patch.dict(radar.os.environ, {'DISCORD_WEBHOOK_URL': 'dummy'}), patch.object(radar, 'send_discord', side_effect=[None, RuntimeError('failed')]):
+                          with self.assertRaises(RuntimeError):
+                              radar.run(state_path=target)
+                      self.assertEqual(radar.json.loads(target.read_text())['seen'], {})
+
+
+          if __name__ == '__main__':
+              unittest.main()
+          TESTS_PY
+          python3 -m unittest discover -s /tmp/radar-code/tests -v
+      - name: Contrôler les sources et envoyer les alertes
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          RADAR_STATUS: ${{ github.event_name != 'schedule' }}
+        shell: bash
+        run: |
+          if [ "$RADAR_STATUS" = "true" ]; then
+            python3 /tmp/radar-code/radar.py --status
+          else
+            python3 /tmp/radar-code/radar.py
+          fi
+      - name: Conserver les alertes déjà envoyées
+        if: always()
+        shell: bash
+        run: |
+          if [ ! -f data/state.json ]; then exit 0; fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add data/state.json
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m "Mémoriser les alertes du radar"
+          git pull --rebase origin main
+          git push origin HEAD:main
