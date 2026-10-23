@@ -65,7 +65,7 @@ jobs:
                      'odr', 'remboursement', "bon d'achat", "bons d'achat", 'fidelite',
                      'sur la carte', 'nouveaux clients', 'nouveau client', "jusqu'a",
                      'a partir de', 'expire', 'epuise', 'coque', 'verre trempe',
-                     'housse', 'compatible avec', 'support pour', 'coupon']
+                     'housse', 'compatible avec', 'support pour', 'coupon', 'dematerialise']
           NUMBER = r'\d+(?:[\s\u00a0\u202f]\d{3})*(?:[.,]\d{1,2})?'
           EURO = r'\s*(?:€|eur\b|euros?\b)'
 
@@ -136,6 +136,103 @@ jobs:
               return None
 
 
+          def feed_price(description):
+              # Observed RSS format: <strong>549€ - E.Leclerc</strong>...
+              match = re.match(r'^\s*(' + NUMBER + ')' + EURO + r'\s*-', normalized(plain(description)))
+              return money(match[1]) if match else None
+
+
+          class PageData(HTMLParser):
+              """Collect JSON without executing page scripts."""
+              def __init__(self):
+                  super().__init__()
+                  self.values, self.script = [], None
+              def handle_starttag(self, tag, attrs):
+                  attrs = dict(attrs)
+                  for key, value in attrs.items():
+                      if key.startswith('data-') and value and value.lstrip().startswith(('{', '[')):
+                          self.values.append(value)
+                  if tag == 'script':
+                      self.script = []
+              def handle_data(self, data):
+                  if self.script is not None:
+                      self.script.append(data)
+              def handle_endtag(self, tag):
+                  if tag == 'script' and self.script is not None:
+                      self.values.append(''.join(self.script))
+                      self.script = None
+
+
+          def extract_reference(page, url, expected_price):
+              """Require the exact deal ID and the same EUR price as the RSS item.
+
+              Adapter for Pepper's embedded thread objects. An unrecognized page fails
+              closed; related offers and generic numbers are never price references.
+              """
+              match = re.search(r'-(\d+)/?$', urlsplit(url).path)
+              if not match or expected_price is None:
+                  return None, 'identite_ou_prix_absent'
+              wanted = match[1]
+              parser = PageData()
+              parser.feed(page)
+              decoder = json.JSONDecoder()
+              roots = []
+              for value in parser.values:
+                  try:
+                      roots.append(json.loads(value))
+                  except (ValueError, RecursionError):
+                      # JSON embedded in a JS assignment, decoded only as JSON.
+                      for hit in list(re.finditer(r'"thread"\s*:\s*(\{)', value))[:20]:
+                          try:
+                              roots.append(decoder.raw_decode(value[hit.start(1):])[0])
+                          except (ValueError, RecursionError):
+                              pass
+              stack, pairs, keys, expired = roots, set(), set(), False
+              inspected = 0
+              while stack and inspected < 20000:
+                  obj = stack.pop()
+                  inspected += 1
+                  if isinstance(obj, dict):
+                      if str(obj.get('threadId', '')) == wanted:
+                          keys.update(obj.keys())
+                          if obj.get('isExpired') is True or obj.get('status') in ('expired', 'deleted'):
+                              expired = True
+                          currency = obj.get('currency', obj.get('priceCurrency', 'EUR'))
+                          current = money(str(obj.get('price', '')))
+                          reference = money(str(obj.get('nextBestPrice', '')))
+                          if currency in ('EUR', '€') and current == expected_price and reference and reference > current:
+                              pairs.add((current, reference))
+                      stack.extend(obj.values())
+                  elif isinstance(obj, list):
+                      stack.extend(obj)
+              if expired:
+                  return None, 'offre_expiree'
+              if len(pairs) != 1:
+                  # Only key names in diagnostics, no page contents or personal data.
+                  reason = 'reference_absente_ou_ambigue; champs=' + ','.join(sorted(keys)[:35])
+                  return None, reason
+              price, reference = next(iter(pairs))
+              return (price, reference, (1 - price / reference) * 100), 'reference_fiche'
+
+
+          def enrich_item(item):
+              expected = feed_price(item['description'])
+              if expected is None:
+                  return None, 'prix_flux_absent'
+              if expected < MIN_PRICE:
+                  return None, 'prix_trop_faible'
+              req = Request(item['link'], headers={'User-Agent': 'RadarPrix/1.1 (personal price alerts)'})
+              try:
+                  with urlopen(req, timeout=10) as response:
+                      page = response.read(4_000_001)
+                  if len(page) > 4_000_000:
+                      return None, 'fiche_trop_volumineuse'
+                  return extract_reference(page.decode('utf-8', errors='replace'), item['link'], expected)
+              except (HTTPError, URLError, TimeoutError, OSError, ValueError, RecursionError) as exc:
+                  reason = f'HTTP {exc.code}' if isinstance(exc, HTTPError) else type(exc).__name__
+                  return None, reason
+
+
           def parse_feed(data):
               if len(data) > 2_000_000 or b'<!DOCTYPE' in data.upper() or b'<!ENTITY' in data.upper():
                   raise ValueError('XML trop volumineux ou non autorisé')
@@ -149,7 +246,7 @@ jobs:
                        ['title', 'description', 'link', 'pubDate']} for item in items]
 
 
-          def candidate(item, now):
+          def candidate(item, now, prices_override=None):
               title = plain(item['title'])
               description = plain(item['description'])
               text = normalized(title + ' ' + description)
@@ -169,7 +266,7 @@ jobs:
                   return None, 'date_absente'
               if age < -300 or age > MAX_AGE_HOURS * 3600:
                   return None, 'trop_ancien'
-              prices = parse_prices(title, description)
+              prices = prices_override or parse_prices(title, description)
               if prices is None:
                   return None, 'prix_ou_reference_absent'
               price, reference, discount = prices
@@ -247,6 +344,8 @@ jobs:
               stats = Counter()
               errors, deals = [], {}
               diagnostic_count = 0
+              detail_count = 0
+              inspected_links = set()
               for source in FEEDS:
                   try:
                       req = Request(source, headers={'User-Agent': 'RadarPrix/1.0 (personal RSS reader)'})
@@ -254,7 +353,26 @@ jobs:
                           items = parse_feed(r.read(2_000_001))
                       stats['flux_lus'] += 1
                       for item in items:
+                          if item['link'] in inspected_links:
+                              continue
+                          inspected_links.add(item['link'])
                           deal, reason = candidate(item, now)
+                          if reason == 'prix_ou_reference_absent' and detail_count < 8:
+                              current = feed_price(item['description'])
+                              if current is not None and current < MIN_PRICE:
+                                  reason = 'prix_trop_faible'
+                              elif current is not None:
+                                  detail_count += 1
+                                  prices, detail_reason = enrich_item(item)
+                                  print('FICHE ' + json.dumps({'url': item['link'], 'resultat': detail_reason}, ensure_ascii=False))
+                                  if prices is not None:
+                                      stats['references_fiches'] += 1
+                                      deal, reason = candidate(item, now, prices)
+                                  elif detail_reason == 'offre_expiree':
+                                      reason = 'exclusion'
+                                  else:
+                                      stats['fiches_sans_reference'] += 1
+                                  time.sleep(0.5)
                           stats[reason] += 1
                           if status and reason == 'prix_ou_reference_absent' and diagnostic_count < 3:
                               # Public feed fields only; never include environment or webhook.
@@ -275,6 +393,7 @@ jobs:
               summary += (f"\nFlux lus : {stats['flux_lus']}/{len(FEEDS)}. "
                           f"Offres avec prix et réduction interprétables : {analyzable}. "
                           f"Offres au seuil : {len(deals)}.\n"
+                          f"Fiches consultées : {detail_count}/8 maximum ; références trouvées : {stats['references_fiches']}.\n"
                           'Sources : offres communautaires Dealabs ; pas de scan direct des boutiques.\n')
               if no_prices:
                   summary += 'Le lecteur ne trouve pas les données nécessaires au filtre −60 % dans les offres ciblées.\n'
@@ -423,6 +542,45 @@ jobs:
 
           if __name__ == '__main__':
               unittest.main()
+
+          class DetailedPageTests(unittest.TestCase):
+              def page(self, data):
+                  import json, html
+                  return '<div data-vue3="' + html.escape(json.dumps({'props': {'thread': data}}), quote=True) + '"></div>'
+
+              def test_observed_rss_prefix(self):
+                  self.assertEqual(radar.feed_price('<strong>549€ - E.Leclerc</strong><br/>Promo'), Decimal('549'))
+                  self.assertEqual(radar.feed_price('<strong>2,99€ - Xbox Store</strong>'), Decimal('2.99'))
+
+              def test_matching_thread_reference(self):
+                  html = self.page({'threadId': 123, 'price': 100, 'nextBestPrice': 250})
+                  values, _ = radar.extract_reference(html, item()['link'], Decimal('100'))
+                  self.assertEqual(values, (Decimal('100'), Decimal('250'), Decimal('60')))
+
+              def test_unrelated_thread_rejected(self):
+                  html = self.page({'threadId': 456, 'price': 100, 'nextBestPrice': 250})
+                  self.assertIsNone(radar.extract_reference(html, item()['link'], Decimal('100'))[0])
+
+              def test_changed_price_rejected(self):
+                  html = self.page({'threadId': 123, 'price': 120, 'nextBestPrice': 250})
+                  self.assertIsNone(radar.extract_reference(html, item()['link'], Decimal('100'))[0])
+
+              def test_expired_and_wrong_currency(self):
+                  for extra in [{'isExpired': True}, {'currency': 'USD'}]:
+                      html = self.page(dict(threadId=123, price=100, nextBestPrice=250, **extra))
+                      self.assertIsNone(radar.extract_reference(html, item()['link'], Decimal('100'))[0])
+
+              def test_popularity_does_not_become_discount(self):
+                  html = self.page({'threadId': 123, 'price': 100, 'temperature': 124})
+                  self.assertIsNone(radar.extract_reference(html, item()['link'], Decimal('100'))[0])
+
+              def test_conflicting_references_fail_closed(self):
+                  html = self.page({'threadId': 123, 'price': 100, 'nextBestPrice': 250})
+                  html += self.page({'threadId': 123, 'price': 100, 'nextBestPrice': 350})
+                  self.assertIsNone(radar.extract_reference(html, item()['link'], Decimal('100'))[0])
+
+              def test_digital_games_excluded(self):
+                  self.assertEqual(radar.candidate(item('Xbox jeu à 20€ au lieu de 100€ (Dématérialisé)'), NOW)[1], 'exclusion')
           TESTS_PY
           python3 -m unittest discover -s /tmp/radar-code/tests -v
       - name: Contrôler les sources et envoyer les alertes
