@@ -181,6 +181,16 @@ jobs:
                   try:
                       roots.append(json.loads(value))
                   except (ValueError, RecursionError):
+                      # Observed on the real Dealabs pages: one script contains several
+                      # assignments. Decode this JSON value without evaluating JavaScript.
+                      initial = re.search(r'window\.__INITIAL_STATE__\s*=\s*', value)
+                      if initial:
+                          try:
+                              state_data = decoder.raw_decode(value[initial.end():])[0]
+                              if isinstance(state_data, dict) and isinstance(state_data.get('threadDetail'), dict):
+                                  roots.append(state_data['threadDetail'])
+                          except (ValueError, RecursionError):
+                              pass
                       # JSON embedded in a JS assignment, decoded only as JSON.
                       for hit in list(re.finditer(r'"thread"\s*:\s*(\{)', value))[:20]:
                           try:
@@ -195,7 +205,7 @@ jobs:
                   if isinstance(obj, dict):
                       if str(obj.get('threadId', '')) == wanted:
                           keys.update(obj.keys())
-                          if obj.get('isExpired') is True or obj.get('status') in ('expired', 'deleted'):
+                          if obj.get('isExpired') is True or str(obj.get('status', '')).lower() in ('expired', 'deleted', 'deactivated'):
                               expired = True
                           currency = obj.get('currency', obj.get('priceCurrency', 'EUR'))
                           current = money(str(obj.get('price', '')))
@@ -597,6 +607,27 @@ jobs:
                           code = radar.run(state_path=Path(directory) / 'state.json')
                       self.assertEqual(code, 2)
                       send.assert_not_called()
+
+          class ObservedInitialStateTests(unittest.TestCase):
+              def test_actual_assignment_shape_and_offer_identity(self):
+                  # Reduced fixture from the two HTML pages captured by GitHub Actions.
+                  import json
+                  for deal_id, price, reference in [(3437051, '549', '599.99'), (3437142, '74.99', '120.23')]:
+                      state = {'threadDetail': {'threadId': str(deal_id), 'price': float(price), 'nextBestPrice': float(reference), 'status': 'Activated', 'isExpired': False},
+                               'recommendations': [{'threadId': '99', 'price': 1, 'nextBestPrice': 100}]}
+                      page = '<script>var modulesConfig = {}; window.__INITIAL_STATE__ = ' + json.dumps(state) + '; window.__RESPONSE_DATA__ = [];</script>'
+                      result, _ = radar.extract_reference(page, f'https://www.dealabs.com/bons-plans/test-{deal_id}', Decimal(price))
+                      self.assertEqual(result[1], Decimal(reference))
+                      self.assertLess(result[2], Decimal('60'))
+
+              def test_qualifying_offer_in_same_actual_structure(self):
+                  page = '<script>window.__INITIAL_STATE__ = {"threadDetail":{"threadId":"123","price":100,"nextBestPrice":250}};</script>'
+                  result, _ = radar.extract_reference(page, item()['link'], Decimal('100'))
+                  self.assertEqual(radar.candidate(item('SSD', '<strong>100€ - Marchand</strong>'), NOW, result)[1], 'retenu')
+
+              def test_missing_reference_in_real_structure_is_not_invented(self):
+                  page = '<script>window.__INITIAL_STATE__ = {"threadDetail":{"threadId":"123","price":100,"nextBestPrice":null},"other":{"threadId":"456","price":100,"nextBestPrice":250}};</script>'
+                  self.assertIsNone(radar.extract_reference(page, item()['link'], Decimal('100'))[0])
           TESTS_PY
           python3 -m unittest discover -s /tmp/radar-code/tests -v
       - name: Contrôler les sources et envoyer les alertes
