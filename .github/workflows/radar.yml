@@ -370,6 +370,29 @@ jobs:
               tmp.replace(path)
 
 
+          def ordered_items(items, now):
+              """Changer l'ordre toutes les 5 min pour parcourir plus de promotions."""
+              slot = int(now // 300)
+              return sorted(items, key=lambda item: hashlib.sha256(
+                  (str(slot) + '|' + item['link']).encode('utf-8')).digest())
+          
+          
+          def unchanged_alert(item, seen):
+              """Éviter les consultations inutiles d'offres déjà signalées au même prix."""
+              u = urlsplit(item['link'])
+              host = (u.hostname or '').removeprefix('www.')
+              if u.scheme != 'https' or host not in SITES:
+                  return False
+              previous = seen.get('https://www.' + host + u.path)
+              current = feed_price(item['description'])
+              if previous is None or current is None:
+                  return False
+              try:
+                  return current >= Decimal(previous['price'])
+              except (KeyError, InvalidOperation, TypeError):
+                  return False
+          
+          
           def run(dry_run=False, status=False, state_path=Path('data/state.json')):
               now = time.time()
               state = json.loads(state_path.read_text()) if state_path.exists() else {}
@@ -390,28 +413,37 @@ jobs:
                       with urlopen(req, timeout=20) as r:
                           items = parse_feed(r.read(2_000_001))
                       stats['flux_lus'] += 1
-                      for item in items:
+                      for item in ordered_items(items, now):
                           if item['link'] in inspected_links:
                               continue
                           inspected_links.add(item['link'])
                           deal, reason = candidate(item, now)
-                          if reason == 'prix_ou_reference_absent' and source_details < DETAIL_LIMIT_PER_SOURCE:
-                              current = feed_price(item['description'])
-                              if current is not None and current < MIN_PRICE:
-                                  reason = 'prix_trop_faible'
-                              elif current is not None:
-                                  detail_count += 1
-                                  source_details += 1
-                                  prices, detail_reason = enrich_item(item, capture=status)
-                                  print('FICHE ' + json.dumps({'url': item['link'], 'resultat': detail_reason}, ensure_ascii=False))
-                                  if prices is not None:
-                                      stats['references_fiches'] += 1
-                                      deal, reason = candidate(item, now, prices)
-                                  elif detail_reason == 'offre_expiree':
-                                      reason = 'exclusion'
+                          # Un pourcentage affiché en RSS ne suffit PAS à déclencher une alerte.
+                          if reason in ('retenu', 'prix_ou_reference_absent'):
+                              if unchanged_alert(item, seen):
+                                  deal, reason = None, 'deja_signale'
+                              elif source_details >= DETAIL_LIMIT_PER_SOURCE:
+                                  deal, reason = None, 'quota_fiches_atteint'
+                              else:
+                                  current = feed_price(item['description'])
+                                  if current is None:
+                                      deal, reason = None, 'prix_flux_absent'
+                                  elif current < MIN_PRICE:
+                                      deal, reason = None, 'prix_trop_faible'
                                   else:
-                                      stats['fiches_sans_reference'] += 1
-                                  time.sleep(0.5)
+                                      detail_count += 1
+                                      source_details += 1
+                                      prices, detail_reason = enrich_item(item, capture=status)
+                                      print('FICHE ' + json.dumps({'url': item['link'], 'resultat': detail_reason}, ensure_ascii=False))
+                                      if prices is not None:
+                                          stats['references_fiches'] += 1
+                                          deal, reason = candidate(item, now, prices)
+                                      elif detail_reason == 'offre_expiree':
+                                          deal, reason = None, 'exclusion'
+                                      else:
+                                          deal, reason = None, 'fiche_non_confirmee'
+                                          stats['fiches_sans_reference'] += 1
+                                      time.sleep(0.5)
                           stats[reason] += 1
                           source_stats[reason] += 1
                           if status and reason == 'prix_ou_reference_absent' and diagnostic_count < 3:
@@ -428,7 +460,7 @@ jobs:
               print(json.dumps({'compteurs': dict(stats), 'erreurs': errors}, ensure_ascii=False))
               # Refuse a green success when no usable price data can be interpreted.
               analyzable = stats['retenu'] + stats['sous_le_seuil']
-              no_prices = stats['prix_ou_reference_absent'] > 0 and analyzable == 0
+              no_prices = sum(stats[k] for k in ('prix_ou_reference_absent', 'fiche_non_confirmee', 'quota_fiches_atteint', 'prix_flux_absent')) > 0 and analyzable == 0
               unhealthy = not stats['flux_lus'] or no_prices
               summary = ('⚠️ Surveillance non validée' if unhealthy else '📡 Contrôle du radar terminé')
               summary += (f"\nFlux lus : {stats['flux_lus']}/{len(FEEDS)}. "
@@ -568,12 +600,18 @@ jobs:
                   with TemporaryDirectory() as directory:
                       target = Path(directory) / 'state.json'
                       xml = ('<rss><channel><item><title>SSD 100€ au lieu de 250€</title>'
-                             '<description>Neuf</description><link>https://www.dealabs.com/bons-plans/ssd-test-123</link>'
+                             '<description><![CDATA[<strong>100€ - Marchand</strong> Neuf]]></description><link>https://www.dealabs.com/bons-plans/ssd-test-123</link>'
                              '<pubDate>' + item()['pubDate'] + '</pubDate></item></channel></rss>').encode()
                       from unittest.mock import MagicMock
                       response = MagicMock()
                       response.__enter__.return_value.read.return_value = xml
-                      with patch.object(radar, 'urlopen', return_value=response), patch.object(radar.time, 'time', return_value=NOW), patch.dict(radar.os.environ, {'DISCORD_WEBHOOK_URL': 'dummy'}), patch.object(radar, 'send_discord', side_effect=[None, RuntimeError('failed')]):
+                      detail_response = MagicMock()
+                      detail_response.__enter__.return_value.read.return_value = (
+                          b'<script>window.__INITIAL_STATE__ = '
+                          b'{"threadDetail":{"threadId":"123","price":100,"nextBestPrice":250}};</script>')
+                      def fake_open(request, timeout=None):
+                          return detail_response if request.full_url.endswith('/ssd-test-123') else response
+                      with patch.object(radar, 'urlopen', side_effect=fake_open), patch.object(radar.time, 'time', return_value=NOW), patch.dict(radar.os.environ, {'DISCORD_WEBHOOK_URL': 'dummy'}), patch.object(radar, 'send_discord', side_effect=[None, RuntimeError('failed')]):
                           with self.assertRaises(RuntimeError):
                               radar.run(status=True, state_path=target)
                       self.assertEqual(radar.json.loads(target.read_text())['seen'], {})
@@ -582,6 +620,34 @@ jobs:
           if __name__ == '__main__':
               unittest.main()
 
+          class AlertVerificationTests(unittest.TestCase):
+              def test_rotation_changes_first_deals(self):
+                  entries = [dict(link=f'https://www.dealabs.com/bons-plans/ssd-{i}') for i in range(40)]
+                  first = radar.ordered_items(entries, NOW)
+                  self.assertEqual(first, radar.ordered_items(entries, NOW + 60))
+                  self.assertNotEqual(first[:8], radar.ordered_items(entries, NOW + 300)[:8])
+          
+              def test_price_drop_reenables_check(self):
+                  offer = item(description='<strong>100€ - Marchand</strong>')
+                  seen = {offer['link']: {'price': '100', 'sent_at': NOW}}
+                  self.assertTrue(radar.unchanged_alert(offer, seen))
+                  offer['description'] = '<strong>90€ - Marchand</strong>'
+                  self.assertFalse(radar.unchanged_alert(offer, seen))
+          
+              def test_rss_discount_without_matching_page_does_not_alert(self):
+                  from unittest.mock import MagicMock
+                  with TemporaryDirectory() as folder:
+                      rss = ('<rss><channel><item><title>SSD 100€ au lieu de 250€</title>'
+                             '<description><![CDATA[<strong>100€ - Marchand</strong>]]></description>'
+                             '<link>https://www.dealabs.com/bons-plans/ssd-test-123</link>'
+                             '<pubDate>' + item()['pubDate'] + '</pubDate></item></channel></rss>').encode()
+                      response = MagicMock()
+                      response.__enter__.return_value.read.return_value = rss
+                      with patch.object(radar, 'urlopen', return_value=response), patch.object(radar.time, 'time', return_value=NOW), patch.dict(radar.os.environ, {'DISCORD_WEBHOOK_URL': 'dummy'}), patch.object(radar, 'send_discord') as send:
+                          radar.run(state_path=Path(folder) / 'state.json')
+                      send.assert_not_called()
+          
+          
           class DetailedPageTests(unittest.TestCase):
               def page(self, data):
                   import json, html
