@@ -49,7 +49,7 @@ jobs:
           from urllib.request import Request, build_opener, HTTPRedirectHandler, urlopen
           import xml.etree.ElementTree as ET
 
-          FEEDS = ['https://www.dealabs.com/rss/tout', 'https://www.dealabs.com/rss/hot.xml']
+          FEEDS = ['https://www.dealabs.com/rss/hot.xml']
           MIN_DISCOUNT = Decimal('60')
           MIN_PRICE = Decimal('20')
           MAX_AGE_HOURS = 6
@@ -246,6 +246,7 @@ jobs:
                   raise ValueError('Le secret DISCORD_WEBHOOK_URL est absent')
               stats = Counter()
               errors, deals = [], {}
+              diagnostic_count = 0
               for source in FEEDS:
                   try:
                       req = Request(source, headers={'User-Agent': 'RadarPrix/1.0 (personal RSS reader)'})
@@ -255,6 +256,11 @@ jobs:
                       for item in items:
                           deal, reason = candidate(item, now)
                           stats[reason] += 1
+                          if status and reason == 'prix_ou_reference_absent' and diagnostic_count < 3:
+                              # Public feed fields only; never include environment or webhook.
+                              sample = {k: v[:4000] for k, v in item.items()}
+                              print('DIAGNOSTIC_OFFRE ' + json.dumps(sample, ensure_ascii=False))
+                              diagnostic_count += 1
                           if deal:
                               deals[deal['url']] = deal
                   except (HTTPError, URLError, TimeoutError, OSError, ValueError, ET.ParseError) as e:
@@ -271,7 +277,7 @@ jobs:
                           f"Offres au seuil : {len(deals)}.\n"
                           'Sources : offres communautaires Dealabs ; pas de scan direct des boutiques.\n')
               if no_prices:
-                  summary += 'Les offres ciblées ne fournissent pas les données nécessaires au filtre −60 %.\n'
+                  summary += 'Le lecteur ne trouve pas les données nécessaires au filtre −60 % dans les offres ciblées.\n'
               if errors:
                   summary += 'Sources en erreur :\n' + '\n'.join(errors) + '\n'
               summary += 'Consulte Actions sur GitHub si le contrôle échoue. Aucun bénéfice garanti.'
