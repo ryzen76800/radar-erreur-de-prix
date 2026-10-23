@@ -1,5 +1,10 @@
 {
-  "seen": {},
-  "last_report": 1792748162.644615,
-  "health": "7ce28d57307c44bf45cb70ae2d7162c5f0adeaadda3ad1fe7c0f988cd129229e"
+  "seen": {
+    "https://www.dealabs.com/bons-plans/lot-de-2-briques-de-rangement-empilables-lego-3436842": {
+      "price": "21.99",
+      "sent_at": 1792748365.919394
+    }
+  },
+  "last_report": 1792748365.919394,
+  "health": "ac8072e7867a47e9ec718ceee7ff17e5e1cb2b65636240ba8d068c78d4d74dff"
 }
